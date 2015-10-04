@@ -1,0 +1,29 @@
+---
+title: "Twitter Data"
+author: "Aaron Palumbo"
+date: "10/4/2015"
+output: html_document
+---
+
+
+```{r}
+library(twitteR)
+library(readr)
+
+# remove carrige return
+rmReturn <- function(s){
+  gsub("\n", "", s)
+}
+
+consumer_key    <- rmReturn(read_file("consumer_key"))
+consumer_secret <- rmReturn(read_file("consumer_secret"))
+access_token    <- rmReturn(read_file("access_token"))
+access_secret   <- rmReturn(read_file("access_secret"))
+
+setup_twitter_oauth(consumer_key,
+                    consumer_secret,
+                    access_token,
+                    access_secret)
+
+r_stats <- searchTwitter("#beer", n=100)
+```
