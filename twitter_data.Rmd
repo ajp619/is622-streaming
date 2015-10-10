@@ -2,14 +2,23 @@
 title: "Twitter Data"
 author: "Aaron Palumbo"
 date: "10/4/2015"
-output: html_document
+output: pdf_document
 ---
 
+## Dependencies
 
 ```{r}
 library(twitteR)
 library(readr)
+library(stringi)
+library(R.utils)
+library(ggplot2)
+```
 
+## Twitter Credentials
+First we establish our twitter credentials
+
+```{r}
 # remove carrige return
 rmReturn <- function(s){
   gsub("\n", "", s)
@@ -24,6 +33,210 @@ setup_twitter_oauth(consumer_key,
                     consumer_secret,
                     access_token,
                     access_secret)
-
-r_stats <- searchTwitter("#beer", n=100)
 ```
+
+# Tweets
+
+Now let's go ahead and pull down some tweets. We're looking for things with a #bigdata hash tag.
+
+```{r}
+numTweets <- 1000
+tweets <- searchTwitter("#bigdata", n=numTweets)
+```
+
+## Parse Tweets
+
+Our goal is to try to look at the characteristics of the other hash tags people use with bigdata. We will now create a data frame from our tweets that we will subsequently push into Spark for analysis.
+
+```{r}
+# function to extract id, username, hashtags, and timestamp from a tweet
+parse_tweet <- function(tweet){
+  id         <- tweet$id
+  username   <- tweet$screenName
+  time.stamp <- tweet$created
+  content    <- tweet$text
+  
+  content <- gsub(pattern="[,\n]", replacement = " ", x = content)
+  hashtags   <- unlist(
+    lapply(unlist(strsplit(content, " ")),
+           function(i){
+             # check for # at beginning and
+             # make sure we don't have any weird characters
+             if (substr(i, 1, 1) == "#" & is.numeric(try(nchar(i)))){
+               return(tolower(i))
+             }
+           })
+    )
+  df <- do.call(rbind,
+                lapply(hashtags,
+                       function(i) {return(data.frame(id=id,
+                                                      user=username,
+                                                      tag=i,
+                                                      time=time.stamp))
+                              }))
+  return(df)
+}
+
+# apply that function to all our tweets
+tdf <- do.call(rbind, lapply(tweets, parse_tweet))
+# tdf
+```
+
+## Process Tweets
+
+Okay, now let's fire up Spark
+
+```{r}
+library(SparkR)
+sc <- sparkR.init()
+sqlContext <- sparkRSQL.init(sc)
+```
+
+## Most popular hash tags
+
+Now let's create a spark data frame from our local data frame
+
+```{r}
+sdf <- createDataFrame(sqlContext, tdf)
+```
+
+We can now take a look at the ten most popular hashtags used with #bigdata
+
+```{r}
+hashtag_counts <- summarize(groupBy(sdf, "tag"), count=n(sdf$tag))
+head(arrange(hashtag_counts, desc(hashtag_counts$count)), 10)
+```
+
+
+## Estimating unique hash tags
+
+Okay, we're going to take a stab at implementing the Flajolet-Martin algorithm to estimate the number of unique items.
+
+First we need hash functions:
+(disclaimer: I have no idea how to create good hash functions. Hopefully this is sufficient)
+
+```{r}
+# we will create a function to create a family of hash functions
+create_hash <- function(){
+  # Use random parameters to differentiate between family members
+  a <- runif(n=1, min=1, max=100)
+  b <- runif(n=1, min=1, max=100)
+  f <- function(word){
+    word <- as.character(word)
+    n <- nchar(word)
+    i <- 1:n
+    hash <- (unlist(stri_enc_toutf32(word)) *  # foreach character create #
+               a * i +                         # mult. according to place
+               b * i)                          # add according to place
+    hash <- intToBin(sum(hash))                # sum and convert to binary
+    return(hash)
+  }
+  return(f)
+}
+
+trailingZeros <- function(hash){
+  ss <- unlist(strsplit(hash, ""))
+  length(ss) - max(which(ss == "1"))
+}
+
+processStream <- function(item){
+  # expects two variables in external scope:
+  # -- f.hash
+  hashed <- unlist(lapply(f.hash, function(i) {i(item)}))
+  unlist(lapply(hashed, trailingZeros))
+}
+```
+
+
+Now we hash each tag with all our hash functions and keep track of the max trailing zeros ($mtz$). Our estimate of the number of unique elements is then $2^{mtz}$.
+
+We then break up our hash functions in to groups and take an average for each group. Finally, we make our final estimate by taking the median of the group means.
+
+We will then compare that to the actual number.
+
+```{r}
+numHash <- 110
+groupNum <- 11
+f.hash <- lapply(1:numHash, function(i) {create_hash()})
+
+estimates <- do.call(rbind, lapply(tdf$tag, processStream))
+estimates.max <- apply(estimates, 2, max)
+result <- median(
+  apply(matrix(2**estimates.max, nrow=5), 2, mean)
+  )
+result
+```
+
+```{r}
+actual <- length(unique(tdf$tag))
+actual
+```
+
+We see that our estimate of `r result` isn't very close to the actual value of `r actual`. Hopefully this is due to the small number of tweets we gathered (or maybe my hash functions).
+
+## Distribution of Hash Tags
+
+Let's take a look at the top 50 hash tags. We already used spark to calculate this and the results are in our hashtag_counts.
+
+```{r}
+# convert to local data frame
+df <- collect(hashtag_counts)
+df <- df[order(df$count, decreasing = TRUE), ]
+```
+
+
+```{r, fig.width=4, fig.height=8}
+numDisplay <- 50
+df.display <- df[1:numDisplay, ]
+df.display <- df.display[nrow(df.display):2, ]
+df.display$tag <- factor(df.display$tag, levels=df.display$tag)
+ggplot(data=df.display, aes(x=tag, y=count)) + 
+  geom_bar(stat="identity") +
+  coord_flip() +
+  ggtitle("Hash tags associated with #bigdata")
+```
+
+Not many surprises here, but still interesting. As noted above, we have almost `r actual` unique hash tags, so we don't expect to see a high concentration of single hash tags.
+
+## User distribution
+
+Let's see who the main people tweeting are:
+
+```{r}
+user_counts <- summarize(groupBy(sdf, "user"), count=n(sdf$user))
+head(arrange(user_counts, desc(user_counts$count)), 10)
+```
+
+```{r}
+# convert to local data frame
+df <- collect(user_counts)
+df <- df[order(df$count, decreasing = TRUE), ]
+```
+
+```{r, fig.width=4, fig.height=8}
+numDisplay <- 50
+df.display <- df[1:numDisplay, ]
+df.display <- df.display[nrow(df.display):1, ]
+df.display$user <- factor(df.display$user, levels=df.display$user)
+ggplot(data=df.display, aes(x=user, y=count)) + 
+  geom_bar(stat="identity") +
+  coord_flip() +
+  ggtitle("Hash tags associated with #bigdata")
+```
+
+We can see from this chart that there are just a few users dominating the conversation. (Who is BigDataTweetBot?!).
+
+BigDataTweetBot (@magicrat_larry):
+> I retweet #bigdata follow to get a feed of all that is tweeted about this subject. createdby @magicrat_larry
+
+## Frequent items
+
+```{r}
+m <- matrix(rbinom(100, 1, 0.5), nrow=10)
+# should be able to do this with matrix mult. to get m then do the folloiwng
+combinations <- t(utils:::combn(1:10, 2))
+tuples <- split(combinations, seq(nrow(combinations)))
+unlist(lapply(tuples, function(t) { m[t[1], t[2]] }))
+# this returns just the upper triangle
+```
+
